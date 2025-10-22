@@ -1,12 +1,13 @@
 /** @file
  *
  *  Copyright (c) 2020, Jeremy Linton
- *  Copyright (c) 2023-2024, Mario Bălănică <mariobalanica02@gmail.com>
+ *  Copyright (c) 2023-2025, Mario Bălănică <mariobalanica02@gmail.com>
  *
  *  SPDX-License-Identifier: BSD-2-Clause-Patent
  *
  **/
 
+#include <Library/BaseMemoryLib.h>
 #include <Library/DebugLib.h>
 #include <Library/RockchipPlatformLib.h>
 #include <Library/UefiRuntimeServicesTableLib.h>
@@ -49,12 +50,13 @@ SetupConfigTableVariables (
   VOID
   )
 {
-  UINTN       Size;
-  UINT32      Var32;
-  UINT8       Var8;
-  EFI_STATUS  Status;
-  UINTN       Index;
-  UINT32      FirstFdtCompatModeSupported;
+  UINTN                            Size;
+  UINT32                           Var32;
+  UINT8                            Var8;
+  EFI_STATUS                       Status;
+  UINTN                            Index;
+  UINT32                           FirstFdtCompatModeSupported;
+  FDT_OVERRIDE_PATH_VARSTORE_DATA  FdtOverridePath;
 
   Size   = sizeof (UINT32);
   Status = gRT->GetVariable (
@@ -145,6 +147,59 @@ SetupConfigTableVariables (
                   );
   if (EFI_ERROR (Status)) {
     Status = PcdSet8S (PcdFdtSupportOverrides, FixedPcdGet8 (PcdFdtSupportOverridesDefault));
+    ASSERT_EFI_ERROR (Status);
+  }
+
+  Size   = sizeof (UINT8);
+  Status = gRT->GetVariable (
+                  L"FdtOverrideFixup",
+                  &gRK3588DxeFormSetGuid,
+                  NULL,
+                  &Size,
+                  &Var8
+                  );
+  if (EFI_ERROR (Status)) {
+    Status = PcdSet8S (PcdFdtOverrideFixup, FixedPcdGet8 (PcdFdtOverrideFixupDefault));
+    ASSERT_EFI_ERROR (Status);
+  }
+
+  Size   = sizeof (FDT_OVERRIDE_PATH_VARSTORE_DATA);
+  Status = gRT->GetVariable (
+                  L"FdtOverrideBasePath",
+                  &gRK3588DxeFormSetGuid,
+                  NULL,
+                  &Size,
+                  &FdtOverridePath
+                  );
+  if (EFI_ERROR (Status) || (FdtOverridePath.Path[0] == L' ')) {
+    if (FixedPcdGetSize (PcdFdtOverrideBasePathDefault) <= Size) {
+      Status = PcdSetPtrS (PcdFdtOverrideBasePath, &Size, FixedPcdGetPtr (PcdFdtOverrideBasePathDefault));
+    } else {
+      ASSERT (FALSE);
+      ZeroMem (&FdtOverridePath, Size);
+      Status = PcdSetPtrS (PcdFdtOverrideBasePath, &Size, &FdtOverridePath);
+    }
+
+    ASSERT_EFI_ERROR (Status);
+  }
+
+  Size   = sizeof (FDT_OVERRIDE_PATH_VARSTORE_DATA);
+  Status = gRT->GetVariable (
+                  L"FdtOverrideOverlayPath",
+                  &gRK3588DxeFormSetGuid,
+                  NULL,
+                  &Size,
+                  &FdtOverridePath
+                  );
+  if (EFI_ERROR (Status) || (FdtOverridePath.Path[0] == L' ')) {
+    if (FixedPcdGetSize (PcdFdtOverrideOverlayPathDefault) <= Size) {
+      Status = PcdSetPtrS (PcdFdtOverrideOverlayPath, &Size, FixedPcdGetPtr (PcdFdtOverrideOverlayPathDefault));
+    } else {
+      ASSERT (FALSE);
+      ZeroMem (&FdtOverridePath, Size);
+      Status = PcdSetPtrS (PcdFdtOverrideOverlayPath, &Size, &FdtOverridePath);
+    }
+
     ASSERT_EFI_ERROR (Status);
   }
 }

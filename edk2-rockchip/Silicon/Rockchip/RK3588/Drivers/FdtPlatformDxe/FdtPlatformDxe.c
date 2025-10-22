@@ -2,7 +2,7 @@
  *
  *  Flattened Device Tree platform driver
  *
- *  Copyright (c) 2023-2024, Mario Bălănică <mariobalanica02@gmail.com>
+ *  Copyright (c) 2023-2025, Mario Bălănică <mariobalanica02@gmail.com>
  *
  *  SPDX-License-Identifier: BSD-2-Clause-Patent
  *
@@ -13,6 +13,7 @@
 
 #include <Library/BaseLib.h>
 #include <Library/DebugLib.h>
+#include <Library/DevicePathLib.h>
 #include <Library/PrintLib.h>
 #include <Library/DxeServicesLib.h>
 #include <Library/MemoryAllocationLib.h>
@@ -116,6 +117,341 @@ FdtOpenIntoAlloc (
 STATIC
 EFI_STATUS
 EFIAPI
+FdtEnableNode (
+  IN         VOID     *Fdt,
+  IN CONST   CHAR8    *NodePath,
+  IN         BOOLEAN  Enable
+  )
+{
+  INT32  Node;
+  INT32  Ret;
+  CHAR8  *NodeStatus;
+
+  Node = fdt_path_offset (Fdt, NodePath);
+  if (Node < 0) {
+    DEBUG ((
+      DEBUG_ERROR,
+      "FdtPlatform: Couldn't locate FDT node path '%a'. Ret=%a\n",
+      NodePath,
+      fdt_strerror (Node)
+      ));
+    return EFI_NOT_FOUND;
+  }
+
+  NodeStatus = Enable ? "okay" : "disabled";
+  Ret        = fdt_setprop_string (Fdt, Node, "status", NodeStatus);
+  if (Ret) {
+    DEBUG ((
+      DEBUG_ERROR,
+      "FdtPlatform: Failed to set '%a' status to '%a'. Ret=%a\n",
+      NodePath,
+      NodeStatus,
+      fdt_strerror (Ret)
+      ));
+    return EFI_UNSUPPORTED;
+  }
+
+  return EFI_SUCCESS;
+}
+
+STATIC
+VOID
+EFIAPI
+FdtFixupComboPhyDevices (
+  IN VOID  *Fdt
+  )
+{
+  EFI_STATUS  Status;
+  UINT32      Index;
+  INT32       Node;
+  INT32       Ret;
+  CONST VOID  *Property;
+  INT32       Length;
+
+  DEBUG ((DEBUG_INFO, "FdtPlatform: Fixing up Combo PHY devices (PCIe, SATA, USB)\n"));
+
+  struct {
+    UINT32    Mode;
+    CHAR8     *PcieNodePath;
+    CHAR8     *SataNodePath;
+    CHAR8     *UsbNodePath;
+  } Phys[] = {
+    { PcdGet32 (PcdComboPhy0Mode), "/pcie@fe190000", "/sata@fe210000", NULL            },
+    { PcdGet32 (PcdComboPhy1Mode), "/pcie@fe170000", "/sata@fe220000", NULL            },
+    { PcdGet32 (PcdComboPhy2Mode), "/pcie@fe180000", "/sata@fe230000", "/usb@fcd00000" },
+  };
+
+  for (Index = 0; Index < ARRAY_SIZE (Phys); Index++) {
+    FdtEnableNode (
+      Fdt,
+      Phys[Index].PcieNodePath,
+      Phys[Index].Mode == COMBO_PHY_MODE_PCIE
+      );
+
+    FdtEnableNode (
+      Fdt,
+      Phys[Index].SataNodePath,
+      Phys[Index].Mode == COMBO_PHY_MODE_SATA
+      );
+
+    if (Phys[Index].UsbNodePath != NULL) {
+      Status = FdtEnableNode (
+                 Fdt,
+                 Phys[Index].UsbNodePath,
+                 Phys[Index].Mode == COMBO_PHY_MODE_USB3
+                 );
+      if (EFI_ERROR (Status)) {
+        FdtEnableNode (
+          Fdt,
+          "/usbhost3_0",
+          Phys[Index].Mode == COMBO_PHY_MODE_USB3
+          );
+        FdtEnableNode (
+          Fdt,
+          "/usbhost3_0/usb@fcd00000",
+          Phys[Index].Mode == COMBO_PHY_MODE_USB3
+          );
+      }
+    }
+
+    //
+    // For M.2 slots supporting both PCIe and SATA, we must reference
+    // the 3V3 supply in SATA mode as well, to prevent the kernel from
+    // turning it off.
+    //
+    if (Phys[Index].Mode == COMBO_PHY_MODE_SATA) {
+      Node = fdt_path_offset (Fdt, Phys[Index].PcieNodePath);
+      if (Node < 0) {
+        continue;
+      }
+
+      Property = fdt_getprop (Fdt, Node, "vpcie3v3-supply", &Length);
+      if (Property == NULL) {
+        continue;
+      }
+
+      ASSERT (Length == sizeof (UINT32));
+
+      Node = fdt_path_offset (Fdt, Phys[Index].SataNodePath);
+      if (Node < 0) {
+        continue;
+      }
+
+      Ret = fdt_setprop (Fdt, Node, "phy-supply", Property, Length);
+      if (Ret < 0) {
+        DEBUG ((
+          DEBUG_ERROR,
+          "FdtPlatform: Failed to set 'phy-supply' property for '%a'. Ret=%a\n",
+          Phys[Index].SataNodePath,
+          fdt_strerror (Ret)
+          ));
+        continue;
+      }
+    }
+  }
+}
+
+STATIC
+VOID
+EFIAPI
+FdtFixupPcie3Devices (
+  IN VOID  *Fdt
+  )
+{
+  if (!FixedPcdGetBool (PcdPcie30Supported)) {
+    return;
+  }
+
+  DEBUG ((DEBUG_INFO, "FdtPlatform: Fixing up PCIe 3 devices\n"));
+
+  FdtEnableNode (
+    Fdt,
+    "/pcie@fe150000",
+    PcdGet32 (PcdPcie30State) == PCIE30_STATE_ENABLED
+    );
+
+  FdtEnableNode (
+    Fdt,
+    "/pcie@fe160000",
+    PcdGet32 (PcdPcie30State) == PCIE30_STATE_ENABLED &&
+    FixedPcdGetBool (PcdPcie30x2Supported) &&
+    PcdGet8 (PcdPcie30PhyMode) != PCIE30_PHY_MODE_AGGREGATION
+    );
+}
+
+STATIC
+VOID
+EFIAPI
+FdtFixupVopDevices (
+  IN VOID  *Fdt
+  )
+{
+  //
+  // This fixup allows Linux to reuse the UEFI GOP framebuffer in cases
+  // where the kernel lacks native support for display output.
+  //
+  // It works by:
+  // 1) disabling VOP device nodes to prevent any existing drivers from
+  //    resetting the hardware.
+  // 2) disabling related power domain nodes to prevent the kernel from
+  //    turning them off for being otherwise unused.
+  // 3) creating fake "regulator-fixed-clock" nodes whose sole purpose is
+  //    to reference and keep the required clocks enabled - again, to
+  //    prevent the kernel from gating them.
+  //
+
+  STATIC CHAR8  *VopNodesToDisable[] = {
+    "/vop@fdd90000",
+    "/iommu@fdd97e00",
+    "/hdmi@fde80000",
+    "/hdmi@fdea0000",
+    "/phy@fed60000",
+    "/phy@fed70000",
+    "/dp@fde50000",
+    "/dp@fde60000",
+    "/edp@fdec0000",
+    "/edp@fded0000",
+    "/dsi@fde20000",
+    "/dsi@fde30000",
+    "/display-subsystem",
+    "/power-management@fd8d8000/power-controller/power-domain@"XS (RK3588_PD_VOP),
+    "/power-management@fd8d8000/power-controller/power-domain@"XS (RK3588_PD_VO1),
+  };
+
+  STATIC UINT32  VopRequiredCruClocks[] = {
+    ACLK_VOP,
+    HCLK_VOP,
+    DCLK_VOP0,
+    DCLK_VOP1,
+    DCLK_VOP2,
+    DCLK_VOP3,
+    PCLK_VOP_ROOT,
+  };
+
+  UINTN  Index;
+  INT32  Root;
+  INT32  Node;
+  INT32  Ret;
+  INT32  CruPhandle;
+
+  if (!PcdGet8 (PcdFdtForceGop)) {
+    return;
+  }
+
+  DEBUG ((DEBUG_INFO, "FdtPlatform: Fixing up VOP devices (force GOP)\n"));
+
+  for (Index = 0; Index < ARRAY_SIZE (VopNodesToDisable); Index++) {
+    FdtEnableNode (Fdt, VopNodesToDisable[Index], FALSE);
+  }
+
+  Root = fdt_path_offset (Fdt, "/");
+  ASSERT (Root >= 0);
+  if (Root < 0) {
+    DEBUG ((DEBUG_ERROR, "FdtPlatform: Couldn't locate FDT root. Ret=%a\n", fdt_strerror (Root)));
+    return;
+  }
+
+  Node = fdt_path_offset (Fdt, "/clock-controller@fd7c0000");
+  if (Node < 0) {
+    DEBUG ((DEBUG_ERROR, "FdtPlatform: Couldn't locate CRU node. Ret=%a\n", fdt_strerror (Node)));
+    return;
+  }
+
+  CruPhandle = fdt_get_phandle (Fdt, Node);
+  if (CruPhandle <= 0) {
+    DEBUG ((DEBUG_ERROR, "FdtPlatform: Failed to get CRU phandle.\n"));
+    return;
+  }
+
+  for (Index = 0; Index < ARRAY_SIZE (VopRequiredCruClocks); Index++) {
+    UINT32  ClockId = VopRequiredCruClocks[Index];
+
+    CHAR8  NodeName[34];
+    AsciiSPrint (NodeName, sizeof (NodeName), "clk-cru-%d-keep-alive-reg", ClockId);
+
+    Node = fdt_add_subnode (Fdt, Root, NodeName);
+    if (Node < 0) {
+      DEBUG ((
+        DEBUG_ERROR,
+        "FdtPlatform: Couldn't create FDT node '%a'. Ret=%a\n",
+        NodeName,
+        fdt_strerror (Node)
+        ));
+      return;
+    }
+
+    Ret = fdt_setprop_string (Fdt, Node, "compatible", "regulator-fixed-clock");
+    if (Ret < 0) {
+      DEBUG ((
+        DEBUG_ERROR,
+        "FdtPlatform: Failed to set 'compatible' property for '%a'. Ret=%a\n",
+        NodeName,
+        fdt_strerror (Ret)
+        ));
+      return;
+    }
+
+    Ret = fdt_setprop_string (Fdt, Node, "regulator-name", NodeName);
+    if (Ret < 0) {
+      DEBUG ((
+        DEBUG_ERROR,
+        "FdtPlatform: Failed to set 'regulator-name' property for '%a'. Ret=%a\n",
+        NodeName,
+        fdt_strerror (Ret)
+        ));
+      return;
+    }
+
+    Ret = fdt_setprop_empty (Fdt, Node, "regulator-always-on");
+    if (Ret < 0) {
+      DEBUG ((
+        DEBUG_ERROR,
+        "FdtPlatform: Failed to set 'regulator-always-on' property for '%a'. Ret=%a\n",
+        NodeName,
+        fdt_strerror (Ret)
+        ));
+      return;
+    }
+
+    UINT32  ClockPair[] = { cpu_to_fdt32 (CruPhandle), cpu_to_fdt32 (ClockId) };
+    Ret = fdt_setprop (Fdt, Node, "clocks", ClockPair, sizeof (ClockPair));
+    if (Ret < 0) {
+      DEBUG ((
+        DEBUG_ERROR,
+        "FdtPlatform: Failed to set 'clocks' property for '%a'. Ret=%a\n",
+        NodeName,
+        fdt_strerror (Ret)
+        ));
+      return;
+    }
+  }
+}
+
+STATIC
+EFI_STATUS
+EFIAPI
+ApplyPlatformFdtFixups (
+  IN OUT VOID  **Fdt
+  )
+{
+  EFI_STATUS  Status;
+
+  // Expand the FDT a bit to give room for any additions.
+  Status = FdtOpenIntoAlloc (Fdt, NULL, fdt_totalsize (*Fdt) + SIZE_4KB);
+  if (EFI_ERROR (Status)) {
+    return Status;
+  }
+
+  FdtFixupComboPhyDevices (*Fdt);
+  FdtFixupPcie3Devices (*Fdt);
+  FdtFixupVopDevices (*Fdt);
+
+  return EFI_SUCCESS;
+}
+
+STATIC
+EFI_STATUS
+EFIAPI
 ReadFdtFromFilePath (
   IN      EFI_FILE_PROTOCOL *Root,
   IN      CHAR16 *Path,
@@ -132,7 +468,12 @@ ReadFdtFromFilePath (
 
   Status = Root->Open (Root, &File, Path, EFI_FILE_MODE_READ, 0);
   if (EFI_ERROR (Status)) {
-    DEBUG ((DEBUG_ERROR, "FdtPlatform: Couldn't open '%s'. Status=%r\n", Path, Status));
+    DEBUG ((
+      Status == EFI_NOT_FOUND ? DEBUG_VERBOSE : DEBUG_ERROR,
+      "FdtPlatform: Couldn't open '%s'. Status=%r\n",
+      Path,
+      Status
+      ));
     return Status;
   }
 
@@ -213,7 +554,7 @@ ReadFdtFromFilePath (
       Path,
       fdt_strerror (Ret)
       ));
-    Status = EFI_NOT_FOUND;
+    Status = EFI_LOAD_ERROR;
     goto Exit;
   }
 
@@ -257,7 +598,7 @@ InstallOverlaysFromDirectoryPath (
   Status = Root->Open (Root, &Dir, Path, EFI_FILE_MODE_READ, 0);
   if (EFI_ERROR (Status)) {
     DEBUG ((
-      DEBUG_ERROR,
+      Status == EFI_NOT_FOUND ? DEBUG_VERBOSE : DEBUG_ERROR,
       "FdtPlatform: Couldn't open directory '%s'. Status=%r\n",
       Path,
       Status
@@ -367,7 +708,107 @@ InstallOverlaysFromDirectoryPath (
   return Status;
 }
 
-STATIC  CHAR16  mDtbOverrideRootPath[] = L"\\dtb";
+STATIC CHAR16  *mDtbOverrideBasePaths[] = {
+  NULL,
+  L"\\dtb",
+  L"\\dtb\\base",
+  L"\\dtb\\rockchip",
+};
+
+STATIC CHAR16  *mDtbOverrideOverlayPaths[] = {
+  NULL,
+  L"\\dtb\\overlays",
+  L"\\dtb\\overlays\\!",
+};
+
+STATIC
+EFI_STATUS
+FdtPlatformBuildOverridePaths (
+  VOID
+  )
+{
+  UINTN        Index;
+  CONST CHAR8  *FdtName;
+  UINTN        FdtNameLen;
+  CHAR16       *OriginalPath;
+  CHAR16       *Path;
+  UINTN        PathSize;
+  UINTN        BasePathLen;
+
+  FdtName    = (CONST CHAR8 *)PcdGetPtr (PcdDeviceTreeName);
+  FdtNameLen = AsciiStrLen (FdtName);
+
+  //
+  // Build base FDT override file paths.
+  // If a directory is provided, the platform FDT file name
+  // will be appended to it.
+  //
+  mDtbOverrideBasePaths[0] = PcdGetPtr (PcdFdtOverrideBasePath);
+
+  for (Index = 0; Index < ARRAY_SIZE (mDtbOverrideBasePaths); Index++) {
+    OriginalPath = mDtbOverrideBasePaths[Index];
+    if (OriginalPath == NULL) {
+      continue;
+    } else if (OriginalPath[0] == CHAR_NULL) {
+      mDtbOverrideBasePaths[Index] = NULL;
+      continue;
+    }
+
+    if (!StrEndsWith (OriginalPath, L".dtb")) {
+      BasePathLen = StrLen (OriginalPath);
+      PathSize    = sizeof (CHAR16) *
+                    (BasePathLen +
+                     StrLen (L"\\") +
+                     FdtNameLen +
+                     StrLen (L".dtb") + 1);
+
+      Path = AllocatePool (PathSize);
+      if (Path == NULL) {
+        ASSERT (FALSE);
+        return EFI_OUT_OF_RESOURCES;
+      }
+
+      UnicodeSPrint (Path, PathSize, L"%s\\%a.dtb", OriginalPath, FdtName);
+
+      mDtbOverrideBasePaths[Index] = Path;
+    }
+  }
+
+  //
+  // Build FDT overlay directory paths.
+  // If ending in "!", the platform FDT base name will be appended.
+  //
+  mDtbOverrideOverlayPaths[0] = PcdGetPtr (PcdFdtOverrideOverlayPath);
+
+  for (Index = 0; Index < ARRAY_SIZE (mDtbOverrideOverlayPaths); Index++) {
+    OriginalPath = mDtbOverrideOverlayPaths[Index];
+    if (OriginalPath == NULL) {
+      continue;
+    } else if (OriginalPath[0] == CHAR_NULL) {
+      mDtbOverrideOverlayPaths[Index] = NULL;
+      continue;
+    }
+
+    if (StrEndsWith (OriginalPath, L"!")) {
+      BasePathLen = StrLen (OriginalPath) - StrLen (L"!");
+      PathSize    = sizeof (CHAR16) *
+                    (BasePathLen +
+                     FdtNameLen + 1);
+
+      Path = AllocatePool (PathSize);
+      if (Path == NULL) {
+        ASSERT (FALSE);
+        return EFI_OUT_OF_RESOURCES;
+      }
+
+      UnicodeSPrint (Path, PathSize, L"%.*s%a", BasePathLen, OriginalPath, FdtName);
+
+      mDtbOverrideOverlayPaths[Index] = Path;
+    }
+  }
+
+  return EFI_SUCCESS;
+}
 
 STATIC
 EFI_STATUS
@@ -378,14 +819,13 @@ FdtPlatformProcessFileSystem (
 {
   EFI_STATUS         Status;
   EFI_FILE_PROTOCOL  *Root;
-  EFI_FILE_PROTOCOL  *DtbDir;
-  UINTN              PathSize;
+  UINTN              Index;
   CHAR16             *Path;
-  CHAR8              *FdtName;
   VOID               *Fdt          = NULL;
   VOID               *NewFdt       = NULL;
   VOID               *FdtToInstall = NULL;
   UINTN              OverlaysCount = 0;
+  INT32              Ret;
 
   Status = FileSystem->OpenVolume (FileSystem, &Root);
   if (EFI_ERROR (Status)) {
@@ -393,53 +833,29 @@ FdtPlatformProcessFileSystem (
     return Status;
   }
 
-  Status = Root->Open (Root, &DtbDir, mDtbOverrideRootPath, EFI_FILE_MODE_READ, 0);
-  if (EFI_ERROR (Status)) {
-    if (Status != EFI_NOT_FOUND) {
-      DEBUG ((
-        DEBUG_ERROR,
-        "FdtPlatform: Failed to open directory '%s'. Status=%r\n",
-        mDtbOverrideRootPath,
-        Status
-        ));
+  //
+  // Look for a base FDT override.
+  //
+  for (Index = 0; Index < ARRAY_SIZE (mDtbOverrideBasePaths); Index++) {
+    Path = mDtbOverrideBasePaths[Index];
+    if (Path == NULL) {
+      continue;
     }
 
-    return Status;
-  } else {
-    DEBUG ((
-      DEBUG_INFO,
-      "FdtPlatform: Found override directory '%s'.\n",
-      mDtbOverrideRootPath
-      ));
+    Status = ReadFdtFromFilePath (Root, Path, NULL, &Fdt);
+    if (!EFI_ERROR (Status)) {
+      DEBUG ((DEBUG_INFO, "FdtPlatform: Loaded FDT override '%s'.\n", Path));
+      break;
+    }
   }
 
-  PathSize = MAX_PATH_LENGTH * sizeof (CHAR16);
-  Path     = AllocatePool (PathSize);
-  if (Path == NULL) {
-    DEBUG ((
-      DEBUG_ERROR,
-      "FdtPlatform: Not enough resources for '%s' access path.\n",
-      mDtbOverrideRootPath
-      ));
-    Root->Close (DtbDir);
-    return EFI_OUT_OF_RESOURCES;
-  }
-
-  FdtName = FixedPcdGetPtr (PcdDeviceTreeName);
-
-  //
-  // Try to open the FDT override.
-  //
-  UnicodeSPrint (Path, PathSize, L"base\\%a.dtb", FdtName);
-  Status = ReadFdtFromFilePath (DtbDir, Path, NULL, &Fdt);
-  if (EFI_ERROR (Status)) {
+  if (Fdt == NULL) {
     if (mPlatformFdt == NULL) {
-      goto Exit;
+      return Status;
     }
 
+    // Not found - use the platform FDT instead.
     Fdt = mPlatformFdt;
-  } else {
-    DEBUG ((DEBUG_INFO, "FdtPlatform: Loaded FDT override '%s'.\n", Path));
   }
 
   //
@@ -448,41 +864,64 @@ FdtPlatformProcessFileSystem (
   //
   Status = FdtOpenIntoAlloc (&Fdt, &NewFdt, fdt_totalsize (Fdt));
   if (EFI_ERROR (Status)) {
-    goto Exit;
+    return Status;
   }
 
   //
-  // Process the overlays common to all platforms.
+  // Apply platform fix-ups to the base FDT override.
   //
-  Status = InstallOverlaysFromDirectoryPath (DtbDir, L"overlays", &NewFdt, &OverlaysCount);
-  if ((Status == EFI_LOAD_ERROR) || (Status == EFI_OUT_OF_RESOURCES)) {
-    goto Exit;
+  if (PcdGet8 (PcdFdtOverrideFixup) && (Fdt != mPlatformFdt)) {
+    ApplyPlatformFdtFixups (&NewFdt);
   }
 
   //
-  // Process the platform-specific overlays.
+  // Process the overlays.
   //
-  UnicodeSPrint (Path, PathSize, L"overlays\\%a", FdtName);
-  Status = InstallOverlaysFromDirectoryPath (DtbDir, Path, &NewFdt, &OverlaysCount);
-  if ((Status == EFI_LOAD_ERROR) || (Status == EFI_OUT_OF_RESOURCES)) {
-    goto Exit;
-  }
+  for (Index = 0; Index < ARRAY_SIZE (mDtbOverrideOverlayPaths); Index++) {
+    Path = mDtbOverrideOverlayPaths[Index];
+    if (Path == NULL) {
+      continue;
+    }
 
-Exit:
-  Root->Close (DtbDir);
-  FreePool (Path);
-
-  if (NewFdt != NULL) {
-    if (fdt_check_header (NewFdt) == 0) {
-      FdtToInstall = NewFdt;
-      DEBUG ((DEBUG_INFO, "FdtPlatform: Using FDT with %d overlays merged.\n", OverlaysCount));
+    Status = InstallOverlaysFromDirectoryPath (Root, Path, &NewFdt, &OverlaysCount);
+    if ((Status == EFI_LOAD_ERROR) || (Status == EFI_OUT_OF_RESOURCES)) {
+      break;
     } else {
-      FreePool (NewFdt);
+      // Ignore non-fatal errors.
+      Status = EFI_SUCCESS;
     }
   }
 
-  if ((Fdt != NULL) && (Fdt != mPlatformFdt)) {
-    if ((FdtToInstall == NULL) && (fdt_check_header (Fdt) == 0)) {
+  //
+  // Use the new FDT if it overrides the platform default and/or has
+  // overlays installed.
+  //
+  if (!EFI_ERROR (Status)) {
+    Ret = fdt_check_header (NewFdt);
+    if (Ret == 0) {
+      if ((Fdt != mPlatformFdt) || (OverlaysCount > 0)) {
+        FdtToInstall = NewFdt;
+        DEBUG ((DEBUG_INFO, "FdtPlatform: Using FDT with %d overlays merged.\n", OverlaysCount));
+      }
+    } else {
+      DEBUG ((
+        DEBUG_ERROR,
+        "FdtPlatform: New FDT has an invalid header! Ret=%a\n",
+        fdt_strerror (Ret)
+        ));
+    }
+  }
+
+  if (FdtToInstall != NewFdt) {
+    FreePool (NewFdt);
+  }
+
+  //
+  // In case the new FDT was unsuitable, fall back to the original if that
+  // still overrides the platform default.
+  //
+  if (Fdt != mPlatformFdt) {
+    if (FdtToInstall == NULL) {
       FdtToInstall = Fdt;
       DEBUG ((DEBUG_INFO, "FdtPlatform: Using original FDT without overlays.\n"));
     } else {
@@ -498,8 +937,121 @@ Exit:
         "FdtPlatform: Failed to install the new FDT as config table. Status=%r\n",
         Status
         ));
+
+      if (FdtToInstall != mPlatformFdt) {
+        FreePool (FdtToInstall);
+      }
     }
+  } else if (!EFI_ERROR (Status)) {
+    Status = EFI_NOT_FOUND;
   }
+
+  return Status;
+}
+
+STATIC
+UINTN
+GetParentDevicePathSize (
+  IN CONST EFI_DEVICE_PATH_PROTOCOL  *DevicePath
+  )
+{
+  CONST EFI_DEVICE_PATH_PROTOCOL  *Node;
+
+  if ((DevicePath == NULL) || IsDevicePathEnd (DevicePath)) {
+    return 0;
+  }
+
+  Node = DevicePath;
+
+  while (!IsDevicePathEnd (NextDevicePathNode (Node))) {
+    Node = NextDevicePathNode (Node);
+  }
+
+  return (UINTN)((UINT8 *)Node - (UINT8 *)DevicePath);
+}
+
+STATIC
+EFI_STATUS
+FdtPlatformProcessLoadedImage (
+  IN EFI_LOADED_IMAGE_PROTOCOL  *LoadedImage
+  )
+{
+  EFI_STATUS                       Status;
+  EFI_DEVICE_PATH_PROTOCOL         *ImageDevicePath;
+  UINTN                            DevicePathSize;
+  EFI_DEVICE_PATH_PROTOCOL         *DevicePath;
+  CHAR16                           *DevicePathText;
+  EFI_HANDLE                       *Handles;
+  UINTN                            HandleCount;
+  UINTN                            Index;
+  EFI_SIMPLE_FILE_SYSTEM_PROTOCOL  *FileSystem;
+
+  if ((LoadedImage == NULL) || (LoadedImage->DeviceHandle == NULL)) {
+    return EFI_INVALID_PARAMETER;
+  }
+
+  ImageDevicePath = DevicePathFromHandle (LoadedImage->DeviceHandle);
+  if (ImageDevicePath == NULL) {
+    return EFI_NOT_FOUND;
+  }
+
+  DevicePathSize = GetParentDevicePathSize (ImageDevicePath);
+  if (DevicePathSize == 0) {
+    DevicePathSize = GetDevicePathSize (ImageDevicePath);
+  }
+
+  Status = gBS->LocateHandleBuffer (
+                  ByProtocol,
+                  &gEfiSimpleFileSystemProtocolGuid,
+                  NULL,
+                  &HandleCount,
+                  &Handles
+                  );
+  if (EFI_ERROR (Status)) {
+    return Status;
+  }
+
+  Status = EFI_NOT_FOUND;
+
+  for (Index = 0; Index < HandleCount; Index++) {
+    DevicePath = DevicePathFromHandle (Handles[Index]);
+    if (DevicePath == NULL) {
+      continue;
+    }
+
+    if (CompareMem (DevicePath, ImageDevicePath, DevicePathSize) != 0) {
+      continue;
+    }
+
+    Status = gBS->HandleProtocol (
+                    Handles[Index],
+                    &gEfiSimpleFileSystemProtocolGuid,
+                    (VOID **)&FileSystem
+                    );
+    if (EFI_ERROR (Status)) {
+      ASSERT_EFI_ERROR (Status);
+      continue;
+    }
+
+    DevicePathText = ConvertDevicePathToText (DevicePath, FALSE, FALSE);
+    DEBUG ((DEBUG_INFO, "FdtPlatform: Processing '%s'\n", DevicePathText));
+    if (DevicePathText != NULL) {
+      FreePool (DevicePathText);
+    }
+
+    Status = FdtPlatformProcessFileSystem (FileSystem);
+    if (EFI_ERROR (Status)) {
+      if (Status != EFI_NOT_FOUND) {
+        DEBUG ((DEBUG_ERROR, "FdtPlatform: Failed to process the file system. Status=%r\n", Status));
+      }
+
+      continue;
+    }
+
+    break;
+  }
+
+  FreePool (Handles);
 
   return Status;
 }
@@ -512,11 +1064,10 @@ NotifyLoadedImage (
   IN VOID       *Context
   )
 {
-  EFI_STATUS                       Status;
-  EFI_HANDLE                       *Handles;
-  UINTN                            HandleCount;
-  EFI_LOADED_IMAGE_PROTOCOL        *LoadedImage;
-  EFI_SIMPLE_FILE_SYSTEM_PROTOCOL  *FileSystem;
+  EFI_STATUS                 Status;
+  EFI_HANDLE                 *Handles;
+  UINTN                      HandleCount;
+  EFI_LOADED_IMAGE_PROTOCOL  *LoadedImage;
 
   while (TRUE) {
     Status = gBS->LocateHandleBuffer (
@@ -555,33 +1106,8 @@ NotifyLoadedImage (
       break;
     }
 
-    if (LoadedImage->DeviceHandle == NULL) {
-      continue;
-    }
-
-    Status = gBS->HandleProtocol (
-                    LoadedImage->DeviceHandle,
-                    &gEfiSimpleFileSystemProtocolGuid,
-                    (VOID **)&FileSystem
-                    );
+    Status = FdtPlatformProcessLoadedImage (LoadedImage);
     if (EFI_ERROR (Status)) {
-      if (Status != EFI_UNSUPPORTED) {
-        DEBUG ((
-          DEBUG_ERROR,
-          "FdtPlatform: Failed to get gEfiSimpleFileSystemProtocolGuid. Status=%r\n",
-          Status
-          ));
-      }
-
-      continue;
-    }
-
-    Status = FdtPlatformProcessFileSystem (FileSystem);
-    if (EFI_ERROR (Status)) {
-      if (Status != EFI_NOT_FOUND) {
-        DEBUG ((DEBUG_ERROR, "FdtPlatform: Failed to process the file system. Status=%r\n", Status));
-      }
-
       continue;
     }
   }
@@ -595,7 +1121,15 @@ NotifyReadyToBoot (
   IN VOID       *Context
   )
 {
+  EFI_STATUS  Status;
+
   gBS->CloseEvent (Event);
+
+  Status = FdtPlatformBuildOverridePaths ();
+  if (EFI_ERROR (Status)) {
+    ASSERT_EFI_ERROR (Status);
+    return;
+  }
 
   EfiCreateProtocolNotifyEvent (
     &gEfiLoadedImageProtocolGuid,
@@ -624,302 +1158,6 @@ NotifyExitBootServices (
     // Some loaders may install a dummy table, warn in this case too.
     DEBUG ((DEBUG_WARN, "FdtPlatform: No usable FDT installed!\n"));
   }
-}
-
-STATIC
-EFI_STATUS
-EFIAPI
-FdtEnableNode (
-  IN         VOID     *Fdt,
-  IN CONST   CHAR8    *NodePath,
-  IN         BOOLEAN  Enable
-  )
-{
-  INT32  Node;
-  INT32  Ret;
-  CHAR8  *NodeStatus;
-
-  Node = fdt_path_offset (Fdt, NodePath);
-  if (Node < 0) {
-    DEBUG ((
-      DEBUG_ERROR,
-      "FdtPlatform: Couldn't locate FDT node path '%a'. Ret=%a\n",
-      NodePath,
-      fdt_strerror (Node)
-      ));
-    return EFI_NOT_FOUND;
-  }
-
-  NodeStatus = Enable ? "okay" : "disabled";
-  Ret        = fdt_setprop_string (Fdt, Node, "status", NodeStatus);
-  if (Ret) {
-    DEBUG ((
-      DEBUG_ERROR,
-      "FdtPlatform: Failed to set '%a' status to '%a'. Ret=%a\n",
-      NodePath,
-      NodeStatus,
-      fdt_strerror (Ret)
-      ));
-    return EFI_UNSUPPORTED;
-  }
-
-  return EFI_SUCCESS;
-}
-
-STATIC
-VOID
-EFIAPI
-FdtFixupComboPhyDevices (
-  IN VOID    *Fdt,
-  IN UINT32  CompatMode
-  )
-{
-  DEBUG ((DEBUG_INFO, "FdtPlatform: Fixing up Combo PHY devices (PCIe, SATA, USB)\n"));
-
-  FdtEnableNode (
-    Fdt,
-    "/pcie@fe170000",
-    PcdGet32 (PcdComboPhy1Mode) == COMBO_PHY_MODE_PCIE
-    );
-  FdtEnableNode (
-    Fdt,
-    "/pcie@fe180000",
-    PcdGet32 (PcdComboPhy2Mode) == COMBO_PHY_MODE_PCIE
-    );
-  FdtEnableNode (
-    Fdt,
-    "/pcie@fe190000",
-    PcdGet32 (PcdComboPhy0Mode) == COMBO_PHY_MODE_PCIE
-    );
-
-  FdtEnableNode (
-    Fdt,
-    "/sata@fe210000",
-    PcdGet32 (PcdComboPhy0Mode) == COMBO_PHY_MODE_SATA
-    );
-  FdtEnableNode (
-    Fdt,
-    "/sata@fe220000",
-    PcdGet32 (PcdComboPhy1Mode) == COMBO_PHY_MODE_SATA
-    );
-  FdtEnableNode (
-    Fdt,
-    "/sata@fe230000",
-    PcdGet32 (PcdComboPhy2Mode) == COMBO_PHY_MODE_SATA
-    );
-
-  switch (CompatMode) {
-    case FDT_COMPAT_MODE_VENDOR:
-      FdtEnableNode (
-        Fdt,
-        "/usbhost3_0",
-        PcdGet32 (PcdComboPhy2Mode) == COMBO_PHY_MODE_USB3
-        );
-      FdtEnableNode (
-        Fdt,
-        "/usbhost3_0/usb@fcd00000",
-        PcdGet32 (PcdComboPhy2Mode) == COMBO_PHY_MODE_USB3
-        );
-      break;
-    case FDT_COMPAT_MODE_MAINLINE:
-      FdtEnableNode (
-        Fdt,
-        "/usb@fcd00000",
-        PcdGet32 (PcdComboPhy2Mode) == COMBO_PHY_MODE_USB3
-        );
-      break;
-  }
-}
-
-STATIC
-VOID
-EFIAPI
-FdtFixupPcie3Devices (
-  IN VOID    *Fdt,
-  IN UINT32  CompatMode
-  )
-{
-  if (!FixedPcdGetBool (PcdPcie30Supported)) {
-    return;
-  }
-
-  DEBUG ((DEBUG_INFO, "FdtPlatform: Fixing up PCIe 3 devices\n"));
-
-  FdtEnableNode (
-    Fdt,
-    "/pcie@fe150000",
-    PcdGet32 (PcdPcie30State) == PCIE30_STATE_ENABLED
-    );
-
-  FdtEnableNode (
-    Fdt,
-    "/pcie@fe160000",
-    PcdGet32 (PcdPcie30State) == PCIE30_STATE_ENABLED &&
-    FixedPcdGetBool (PcdPcie30x2Supported) &&
-    PcdGet8 (PcdPcie30PhyMode) != PCIE30_PHY_MODE_AGGREGATION
-    );
-}
-
-STATIC
-VOID
-EFIAPI
-FdtFixupVopDevices (
-  IN VOID    *Fdt,
-  IN UINT32  CompatMode
-  )
-{
-  //
-  // This fixup allows Linux to reuse the UEFI GOP framebuffer in cases
-  // where the kernel lacks native support for display output.
-  //
-  // It works by:
-  // 1) disabling VOP device nodes to prevent any existing drivers from
-  //    resetting the hardware.
-  // 2) disabling related power domain nodes to prevent the kernel from
-  //    turning them off for being otherwise unused.
-  // 3) creating fake "regulator-fixed-clock" nodes whose sole purpose is
-  //    to reference and keep the required clocks enabled - again, to
-  //    prevent the kernel from gating them.
-  //
-
-  STATIC CHAR8  *VopNodesToDisable[] = {
-    "/vop@fdd90000",
-    "/iommu@fdd97e00",
-    "/hdmi@fde80000",
-    "/hdmi@fdea0000",
-    "/phy@fed60000",
-    "/phy@fed70000",
-    "/dp@fde50000",
-    "/dp@fde60000",
-    "/edp@fdec0000",
-    "/edp@fded0000",
-    "/dsi@fde20000",
-    "/dsi@fde30000",
-    "/display-subsystem",
-    "/power-management@fd8d8000/power-controller/power-domain@"XS (RK3588_PD_VOP),
-    "/power-management@fd8d8000/power-controller/power-domain@"XS (RK3588_PD_VO1),
-  };
-
-  STATIC UINT32  VopRequiredCruClocks[] = {
-    ACLK_VOP,
-    HCLK_VOP,
-    DCLK_VOP0,
-    DCLK_VOP1,
-    DCLK_VOP2,
-    DCLK_VOP3,
-    PCLK_VOP_ROOT,
-  };
-
-  UINTN  Index;
-  INT32  Root;
-  INT32  Node;
-  INT32  Ret;
-  INT32  CruPhandle;
-
-  if ((CompatMode != FDT_COMPAT_MODE_MAINLINE) || !PcdGet8 (PcdFdtForceGop)) {
-    return;
-  }
-
-  DEBUG ((DEBUG_INFO, "FdtPlatform: Fixing up VOP devices (force GOP)\n"));
-
-  for (Index = 0; Index < ARRAY_SIZE (VopNodesToDisable); Index++) {
-    FdtEnableNode (Fdt, VopNodesToDisable[Index], FALSE);
-  }
-
-  Root = fdt_path_offset (Fdt, "/");
-  ASSERT (Root >= 0);
-  if (Root < 0) {
-    DEBUG ((DEBUG_ERROR, "FdtPlatform: Couldn't locate FDT root. Ret=%a\n", fdt_strerror (Root)));
-    return;
-  }
-
-  Node = fdt_path_offset (Fdt, "/clock-controller@fd7c0000");
-  if (Node < 0) {
-    DEBUG ((DEBUG_ERROR, "FdtPlatform: Couldn't locate CRU node. Ret=%a\n", fdt_strerror (Node)));
-    return;
-  }
-
-  CruPhandle = fdt_get_phandle (Fdt, Node);
-  if (CruPhandle <= 0) {
-    DEBUG ((DEBUG_ERROR, "FdtPlatform: Failed to get CRU phandle.\n"));
-    return;
-  }
-
-  for (Index = 0; Index < ARRAY_SIZE (VopRequiredCruClocks); Index++) {
-    UINT32  ClockId = VopRequiredCruClocks[Index];
-
-    CHAR8  NodeName[34];
-    AsciiSPrint (NodeName, sizeof (NodeName), "clk-cru-%d-keep-alive-reg", ClockId);
-
-    Node = fdt_add_subnode (Fdt, Root, NodeName);
-    if (Node < 0) {
-      DEBUG ((
-        DEBUG_ERROR,
-        "FdtPlatform: Couldn't create FDT node '%a'. Ret=%a\n",
-        NodeName,
-        fdt_strerror (Node)
-        ));
-      return;
-    }
-
-    Ret = fdt_setprop_string (Fdt, Node, "compatible", "regulator-fixed-clock");
-    if (Ret < 0) {
-      DEBUG ((
-        DEBUG_ERROR,
-        "FdtPlatform: Failed to set 'compatible' property for '%a'. Ret=%a\n",
-        NodeName,
-        fdt_strerror (Ret)
-        ));
-      return;
-    }
-
-    Ret = fdt_setprop_string (Fdt, Node, "regulator-name", NodeName);
-    if (Ret < 0) {
-      DEBUG ((
-        DEBUG_ERROR,
-        "FdtPlatform: Failed to set 'regulator-name' property for '%a'. Ret=%a\n",
-        NodeName,
-        fdt_strerror (Ret)
-        ));
-      return;
-    }
-
-    Ret = fdt_setprop_empty (Fdt, Node, "regulator-always-on");
-    if (Ret < 0) {
-      DEBUG ((
-        DEBUG_ERROR,
-        "FdtPlatform: Failed to set 'regulator-always-on' property for '%a'. Ret=%a\n",
-        NodeName,
-        fdt_strerror (Ret)
-        ));
-      return;
-    }
-
-    UINT32  ClockPair[] = { cpu_to_fdt32 (CruPhandle), cpu_to_fdt32 (ClockId) };
-    Ret = fdt_setprop (Fdt, Node, "clocks", ClockPair, sizeof (ClockPair));
-    if (Ret < 0) {
-      DEBUG ((
-        DEBUG_ERROR,
-        "FdtPlatform: Failed to set 'clocks' property for '%a'. Ret=%a\n",
-        NodeName,
-        fdt_strerror (Ret)
-        ));
-      return;
-    }
-  }
-}
-
-STATIC
-VOID
-EFIAPI
-ApplyPlatformFdtFixups (
-  IN VOID    *Fdt,
-  IN UINT32  CompatMode
-  )
-{
-  FdtFixupComboPhyDevices (Fdt, CompatMode);
-  FdtFixupPcie3Devices (Fdt, CompatMode);
-  FdtFixupVopDevices (Fdt, CompatMode);
 }
 
 STATIC
@@ -980,12 +1218,6 @@ LoadPlatformFdt (
     return EFI_NOT_FOUND;
   }
 
-  // Expand the FDT a bit to give room for any additions.
-  Status = FdtOpenIntoAlloc (&Fdt, NULL, fdt_totalsize (Fdt) + SIZE_4KB);
-  if (EFI_ERROR (Status)) {
-    return Status;
-  }
-
   *PlatformFdt = Fdt;
 
   return EFI_SUCCESS;
@@ -1037,7 +1269,7 @@ FdtPlatformDxeInitialize (
     return EFI_SUCCESS;
   }
 
-  ApplyPlatformFdtFixups (mPlatformFdt, CompatMode);
+  ApplyPlatformFdtFixups (&mPlatformFdt);
 
   Status = gBS->InstallConfigurationTable (&gFdtTableGuid, mPlatformFdt);
   if (EFI_ERROR (Status)) {
