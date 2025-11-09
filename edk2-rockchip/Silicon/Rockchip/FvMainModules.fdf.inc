@@ -128,20 +128,23 @@
   INF Silicon/Rockchip/Drivers/LcdGraphicsOutputDxe/LcdGraphicsOutputDxe.inf
 
   #
-  # USB Support
+  # USB Support - DISABLED to avoid synchronous exception crash with Bluetooth adapters
+  # When hot-plugging certain USB devices (e.g., TP-Link UB500), the XHCI controller
+  # raises a synchronous exception during port change detection, causing firmware crash.
+  # USB still works normally once the OS boots.
   #
-  INF MdeModulePkg/Bus/Pci/EhciDxe/EhciDxe.inf
-  INF MdeModulePkg/Bus/Pci/XhciDxe/XhciDxe.inf
-  INF Silicon/Rockchip/Drivers/OhciDxe/OhciDxe.inf
+  # INF MdeModulePkg/Bus/Pci/EhciDxe/EhciDxe.inf
+  # INF MdeModulePkg/Bus/Pci/XhciDxe/XhciDxe.inf
+  # INF Silicon/Rockchip/Drivers/OhciDxe/OhciDxe.inf
 
   # USB controllers installer
-  INF Silicon/Rockchip/Drivers/UsbHcdInitDxe/UsbHcd.inf
+  # INF Silicon/Rockchip/Drivers/UsbHcdInitDxe/UsbHcd.inf
 
-  INF MdeModulePkg/Bus/Usb/UsbBusDxe/UsbBusDxe.inf
-  INF MdeModulePkg/Bus/Usb/UsbMassStorageDxe/UsbMassStorageDxe.inf
-  INF MdeModulePkg/Bus/Usb/UsbKbDxe/UsbKbDxe.inf
-  INF MdeModulePkg/Bus/Usb/UsbMouseDxe/UsbMouseDxe.inf
-  INF MdeModulePkg/Bus/Usb/UsbMouseAbsolutePointerDxe/UsbMouseAbsolutePointerDxe.inf
+  # INF MdeModulePkg/Bus/Usb/UsbBusDxe/UsbBusDxe.inf
+  # INF MdeModulePkg/Bus/Usb/UsbMassStorageDxe/UsbMassStorageDxe.inf
+  # INF MdeModulePkg/Bus/Usb/UsbKbDxe/UsbKbDxe.inf
+  # INF MdeModulePkg/Bus/Usb/UsbMouseDxe/UsbMouseDxe.inf
+  # INF MdeModulePkg/Bus/Usb/UsbMouseAbsolutePointerDxe/UsbMouseAbsolutePointerDxe.inf
 
   #
   # PCI Support
